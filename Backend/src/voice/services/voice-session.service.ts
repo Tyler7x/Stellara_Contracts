@@ -5,12 +5,23 @@ import { VoiceSession, VoiceMessage } from '../entities/voice-session.entity';
 import { ConversationState } from '../types/conversation-state.enum';
 import { randomUUID as uuidv4 } from 'crypto';
 
+/** Maximum number of concurrent sessions allowed per user (AC-4) */
+export const MAX_SESSIONS_PER_USER = 3;
+
+/** Heartbeat timeout in milliseconds — sessions silent longer than this are stale (AC-2) */
+export const HEARTBEAT_TIMEOUT_MS = 60_000;
+
 @Injectable()
 export class VoiceSessionService implements OnModuleInit {
   private readonly logger = new Logger(VoiceSessionService.name);
+
+  // Redis key prefixes
   private readonly SESSION_PREFIX = 'voice:session:';
   private readonly USER_SESSIONS_PREFIX = 'voice:user:sessions:';
-  private readonly SESSION_TTL = 3600; // 1 hour
+  private readonly USER_ACTIVE_SESSION_PREFIX = 'voice:usersession:';
+
+  private readonly SESSION_TTL = 3600; // 1 hour — full session lifetime
+  private readonly USER_SESSION_POINTER_TTL = 600; // 10 minutes (AC-1)
 
   constructor(
     private readonly redisService: RedisService,
@@ -21,12 +32,24 @@ export class VoiceSessionService implements OnModuleInit {
     this.logger.log('VoiceSessionService initialized');
   }
 
+  // ---------------------------------------------------------------------------
+  // Session CRUD
+  // ---------------------------------------------------------------------------
+
   async createSession(
     userId: string,
     context: any,
     walletAddress?: string,
     metadata?: Record<string, any>,
   ): Promise<VoiceSession> {
+    // AC-4: enforce max 3 concurrent sessions per user
+    const activeSessions = await this.getUserActiveSessions(userId);
+    if (activeSessions.length >= MAX_SESSIONS_PER_USER) {
+      throw new Error(
+        `Session limit reached: users may have at most ${MAX_SESSIONS_PER_USER} concurrent sessions`,
+      );
+    }
+
     const session = VoiceSession.create(
       userId,
       context,
@@ -55,6 +78,7 @@ export class VoiceSessionService implements OnModuleInit {
         ...session,
         createdAt: new Date(session.createdAt),
         lastActivityAt: new Date(session.lastActivityAt),
+        lastPingAt: session.lastPingAt ? new Date(session.lastPingAt) : undefined,
         messages: session.messages.map((msg: any) => ({
           ...msg,
           timestamp: new Date(msg.timestamp),
@@ -149,6 +173,7 @@ export class VoiceSessionService implements OnModuleInit {
 
       await this.redisService.client.del(this.SESSION_PREFIX + sessionId);
       await this.removeUserSession(session.userId, sessionId);
+      await this.clearUserActiveSessionIfMatches(session.userId, sessionId);
 
       this.logger.log(`Terminated voice session ${sessionId}`);
       return true;
@@ -176,14 +201,124 @@ export class VoiceSessionService implements OnModuleInit {
     }
   }
 
+  async updateSessionSocket(
+    sessionId: string,
+    socketId: string,
+  ): Promise<boolean> {
+    const session = await this.getSession(sessionId);
+    if (!session) {
+      return false;
+    }
+
+    session.socketId = socketId;
+    session.lastActivityAt = new Date();
+
+    await this.saveSession(session);
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // AC-1 — Redis-backed user-session active pointer
+  // ---------------------------------------------------------------------------
+
+  async setUserActiveSession(userId: string, sessionId: string): Promise<void> {
+    await this.redisService.client.setEx(
+      this.USER_ACTIVE_SESSION_PREFIX + userId,
+      this.USER_SESSION_POINTER_TTL,
+      sessionId,
+    );
+  }
+
+  async getUserActiveSession(userId: string): Promise<string | null> {
+    return this.redisService.client.get(
+      this.USER_ACTIVE_SESSION_PREFIX + userId,
+    );
+  }
+
+  async deleteUserActiveSession(userId: string): Promise<void> {
+    await this.redisService.client.del(
+      this.USER_ACTIVE_SESSION_PREFIX + userId,
+    );
+  }
+
+  async refreshUserSessionTTL(userId: string): Promise<void> {
+    await this.redisService.refreshTTL(
+      this.USER_ACTIVE_SESSION_PREFIX + userId,
+      this.USER_SESSION_POINTER_TTL,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // AC-2 — Heartbeat ping tracking
+  // ---------------------------------------------------------------------------
+
+  async updateLastPingAt(sessionId: string): Promise<boolean> {
+    const session = await this.getSession(sessionId);
+    if (!session) {
+      return false;
+    }
+
+    session.lastPingAt = new Date();
+    session.lastActivityAt = new Date();
+
+    await this.saveSession(session);
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cleanup — AC-2 (stale) + existing TTL-based
+  // ---------------------------------------------------------------------------
+
+  async cleanupStaleSessions(): Promise<number> {
+    const now = Date.now();
+    let cleanedCount = 0;
+
+    try {
+      const keys = await this.redisService.scanKeys(this.SESSION_PREFIX + '*');
+
+      for (const key of keys) {
+        const sessionData = await this.redisService.client.get(key);
+        if (!sessionData) continue;
+
+        const session = JSON.parse(sessionData) as VoiceSession;
+
+        if (
+          session.state === ConversationState.TERMINATED ||
+          session.state === ConversationState.STALE
+        ) {
+          continue;
+        }
+
+        const lastPingMs = session.lastPingAt
+          ? new Date(session.lastPingAt).getTime()
+          : new Date(session.createdAt).getTime();
+
+        if (now - lastPingMs > HEARTBEAT_TIMEOUT_MS) {
+          const sessionId = key.replace(this.SESSION_PREFIX, '');
+          this.logger.warn(
+            `Session ${sessionId} is stale (no ping for ${Math.round((now - lastPingMs) / 1000)}s); terminating`,
+          );
+          await this.terminateSession(sessionId);
+          cleanedCount++;
+        }
+      }
+    } catch (error) {
+      this.logger.error('Error during stale session cleanup:', error);
+    }
+
+    if (cleanedCount > 0) {
+      this.logger.log(`Cleaned up ${cleanedCount} stale sessions`);
+    }
+
+    return cleanedCount;
+  }
+
   async cleanupExpiredSessions(): Promise<number> {
     const now = Date.now();
     let cleanedCount = 0;
 
     try {
-      const keys = await this.redisService.client.keys(
-        this.SESSION_PREFIX + '*',
-      );
+      const keys = await this.redisService.scanKeys(this.SESSION_PREFIX + '*');
 
       for (const key of keys) {
         const sessionData = await this.redisService.client.get(key);
@@ -210,21 +345,9 @@ export class VoiceSessionService implements OnModuleInit {
     return cleanedCount;
   }
 
-  async updateSessionSocket(
-    sessionId: string,
-    socketId: string,
-  ): Promise<boolean> {
-    const session = await this.getSession(sessionId);
-    if (!session) {
-      return false;
-    }
-
-    session.socketId = socketId;
-    session.lastActivityAt = new Date();
-
-    await this.saveSession(session);
-    return true;
-  }
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
 
   private async saveSession(session: VoiceSession): Promise<void> {
     const sessionData = JSON.stringify(session);
@@ -257,5 +380,15 @@ export class VoiceSessionService implements OnModuleInit {
       this.USER_SESSIONS_PREFIX + userId,
       sessionId,
     );
+  }
+
+  private async clearUserActiveSessionIfMatches(
+    userId: string,
+    sessionId: string,
+  ): Promise<void> {
+    const current = await this.getUserActiveSession(userId);
+    if (current === sessionId) {
+      await this.deleteUserActiveSession(userId);
+    }
   }
 }

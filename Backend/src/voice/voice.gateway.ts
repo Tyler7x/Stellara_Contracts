@@ -33,7 +33,6 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   server: Server;
 
   private readonly logger = new Logger(VoiceGateway.name);
-  private readonly userSessions = new Map<string, string>();
 
   constructor(
     private readonly voiceSessionService: VoiceSessionService,
@@ -59,7 +58,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         await this.voiceSessionService.updateSessionSocket(sessionId, client.id);
         await this.voiceSessionService.resumeSession(sessionId);
         client.join(sessionId);
-        this.userSessions.set(userId, sessionId);
+        await this.voiceSessionService.setUserActiveSession(userId, sessionId);
         client.emit('voice:resumed', { sessionId, state: session.state });
         this.logger.log(`Resumed voice session ${sessionId} for user ${userId}`);
       } else {
@@ -76,8 +75,11 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.logger.log(`Voice client disconnected: ${client.id}, userId: ${userId}`);
 
     if (userId && sessionId) {
-      await this.voiceSessionService.updateSessionState(sessionId, ConversationState.IDLE);
-      this.userSessions.delete(userId);
+      await this.voiceSessionService.updateSessionState(
+        sessionId,
+        ConversationState.IDLE,
+      );
+      await this.voiceSessionService.deleteUserActiveSession(userId);
     }
   }
 
@@ -96,21 +98,34 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         const existingSession = existingSessions[0];
         await this.voiceSessionService.updateSessionSocket(existingSession.id, client.id);
         client.join(existingSession.id);
-        this.userSessions.set(userId, existingSession.id);
+        await this.voiceSessionService.setUserActiveSession(userId, existingSession.id);
         client.emit('voice:session-created', { session: existingSession });
         return;
       }
 
-      const session = await this.voiceSessionService.createSession(
-        createSessionDto.userId,
-        createSessionDto.context,
-        createSessionDto.walletAddress,
-        createSessionDto.metadata,
-      );
+      let session;
+      try {
+        session = await this.voiceSessionService.createSession(
+          createSessionDto.userId,
+          createSessionDto.context,
+          createSessionDto.walletAddress,
+          createSessionDto.metadata,
+        );
+      } catch (err: any) {
+        if (err.message?.includes('Session limit reached')) {
+          client.emit('voice:error', {
+            code: 'SESSION_LIMIT_REACHED',
+            message: err.message,
+          });
+          return;
+        }
+        throw err;
+      }
 
       await this.voiceSessionService.updateSessionSocket(session.id, client.id);
       client.join(session.id);
-      this.userSessions.set(userId, session.id);
+      await this.voiceSessionService.setUserActiveSession(userId, session.id);
+
       client.emit('voice:session-created', { session });
       this.logger.log(`Created voice session ${session.id} for user ${userId}`);
     } catch (error) {
@@ -124,7 +139,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleMessage(@ConnectedSocket() client: Socket, @MessageBody() messageDto: VoiceMessageDto) {
     try {
       const userId = client.data.user?.sub || client.data.user?.userId;
-      const sessionId = this.userSessions.get(userId);
+      const sessionId = await this.voiceSessionService.getUserActiveSession(userId);
 
       if (!sessionId) {
         client.emit('voice:error', { message: 'No active session' });
@@ -155,7 +170,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleInterrupt(@ConnectedSocket() client: Socket, @MessageBody() data: { streamId?: string }) {
     try {
       const userId = client.data.user?.sub || client.data.user?.userId;
-      const sessionId = this.userSessions.get(userId);
+      const sessionId = await this.voiceSessionService.getUserActiveSession(userId);
 
       if (!sessionId) {
         client.emit('voice:error', { message: 'No active session' });
@@ -184,7 +199,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleSessionAction(@ConnectedSocket() client: Socket, @MessageBody() actionDto: SessionActionDto) {
     try {
       const userId = client.data.user?.sub || client.data.user?.userId;
-      const sessionId = this.userSessions.get(userId);
+      const sessionId = await this.voiceSessionService.getUserActiveSession(userId);
 
       if (!sessionId) {
         client.emit('voice:error', { message: 'No active session' });
@@ -214,7 +229,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async handleTerminate(@ConnectedSocket() client: Socket) {
     try {
       const userId = client.data.user?.sub || client.data.user?.userId;
-      const sessionId = this.userSessions.get(userId);
+      const sessionId = await this.voiceSessionService.getUserActiveSession(userId);
 
       if (!sessionId) {
         client.emit('voice:error', { message: 'No active session' });
@@ -222,11 +237,12 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
 
       await this.streamingResponseService.interruptStream(this.server, sessionId);
+
       const success = await this.voiceSessionService.terminateSession(sessionId);
 
       if (success) {
         client.leave(sessionId);
-        this.userSessions.delete(userId);
+        await this.voiceSessionService.deleteUserActiveSession(userId);
         client.emit('voice:terminated', { sessionId });
         this.logger.log(`Terminated voice session ${sessionId} for user ${userId}`);
       } else {
@@ -242,10 +258,12 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('voice:ping')
   async handlePing(@ConnectedSocket() client: Socket) {
     const userId = client.data.user?.sub || client.data.user?.userId;
-    const sessionId = this.userSessions.get(userId);
+    const sessionId = await this.voiceSessionService.getUserActiveSession(userId);
 
     if (sessionId) {
       await this.voiceSessionService.updateSessionSocket(sessionId, client.id);
+      await this.voiceSessionService.updateLastPingAt(sessionId);
+      await this.voiceSessionService.refreshUserSessionTTL(userId);
     }
 
     client.emit('voice:pong', { timestamp: Date.now() });

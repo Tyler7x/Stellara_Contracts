@@ -38,6 +38,9 @@ export class VoiceSession {
   @Column({ type: 'timestamptz' })
   lastActivityAt: Date;
 
+  @Column({ type: 'timestamptz', nullable: true })
+  lastPingAt?: Date;
+
   @Column({ type: 'int' })
   ttl: number;
 
