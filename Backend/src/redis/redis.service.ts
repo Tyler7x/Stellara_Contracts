@@ -35,7 +35,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
    */
   async scanKeys(pattern: string): Promise<string[]> {
     const keys: string[] = [];
-    let cursor = 0;
+    let cursor = '0';
 
     do {
       const reply = await this.client.scan(cursor, {
@@ -44,7 +44,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       });
       cursor = reply.cursor;
       keys.push(...reply.keys);
-    } while (cursor !== 0);
+    } while (cursor !== '0');
 
     return keys;
   }
