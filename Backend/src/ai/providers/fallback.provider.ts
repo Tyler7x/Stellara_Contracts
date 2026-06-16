@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { AiProvider, AI_PROVIDER } from '../ai.provider';
+import type { AiProvider } from '../ai.provider';
+import { AI_PROVIDER } from '../ai.provider';
 import { AiCacheService } from '../cache/ai-cache.service';
 
 @Injectable()
